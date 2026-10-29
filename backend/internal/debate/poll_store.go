@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/google/uuid"
@@ -98,10 +99,44 @@ func (ps *PollStore) CreatePoll(debateID, pollID, question string, options []str
 	return pollID, nil
 }
 
+// pollOptions returns the options a poll offers, from the metadata written by
+// CreatePoll. It returns an error when that metadata is missing or unusable, so
+// a vote is never accepted against options that the poll did not define.
+func (ps *PollStore) pollOptions(debateID, pollID string) ([]string, error) {
+	metaKey := fmt.Sprintf("debate:%s:poll:%s:meta", debateID, pollID)
+
+	metaStr, err := ps.rdb.Get(ps.ctx, metaKey).Result()
+	if err != nil || metaStr == "" {
+		return nil, fmt.Errorf("poll not found")
+	}
+
+	var meta PollMetadata
+	if err := json.Unmarshal([]byte(metaStr), &meta); err != nil {
+		return nil, fmt.Errorf("failed to read poll options: %w", err)
+	}
+	if len(meta.Options) == 0 {
+		return nil, fmt.Errorf("poll has no options")
+	}
+
+	return meta.Options, nil
+}
+
 // Vote handles a vote request and returns whether it was successful
 func (ps *PollStore) Vote(debateID, pollID, option, spectatorHash string) (bool, error) {
 	if ps == nil || ps.rdb == nil {
 		return false, fmt.Errorf("Redis client not available")
+	}
+
+	options, err := ps.pollOptions(debateID, pollID)
+	if err != nil {
+		return false, err
+	}
+
+	// Reject an option the poll does not offer before touching the voter set:
+	// HIncrBy would create the field, and a rejected vote should not cost the
+	// spectator their one vote.
+	if !slices.Contains(options, option) {
+		return false, fmt.Errorf("option is not part of the poll")
 	}
 
 	votersKey := fmt.Sprintf("debate:%s:poll:%s:voters", debateID, pollID)
